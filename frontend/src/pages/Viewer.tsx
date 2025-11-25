@@ -1,0 +1,2229 @@
+import { useEffect, useRef, useState } from "react";
+import * as OBC from "openbim-components";
+import * as THREE from "three";
+import ActionBar from "../components/ActionBar";
+import CommentPanel from "../components/CommentPanel";
+import DimensionOptionsPanel from "../components/DimensionOptionsPanel";
+import { SearchPanel } from "../components/SearchPanel";
+import { SelectionPanel, SelectedElement } from "../components/SelectionPanel";
+import { IFCUploader } from "../components/IFCUploader";
+import { CostSummary } from "../components/CostSummary";
+import { VisibilityControls } from "../components/VisibilityControls";
+import { ElementsList } from "../components/ElementsList";
+import { useTheme } from "../contexts/ThemeContext";
+import { useComments } from "../hooks/useComments";
+import { useIFCData } from "../hooks/useIFCData";
+import { SimpleDimensionTool } from "../utils/SimpleDimensionTool";
+
+const Viewer = () => {
+  const viewerContainerRef = useRef<HTMLDivElement>(null);
+  const viewerRef = useRef<OBC.Components | null>(null);
+  const [activeAction, setActiveAction] = useState<string>("move");
+  const [showCommentPanel, setShowCommentPanel] = useState(false);
+  const [selectedElementId, setSelectedElementId] = useState<string | undefined>();
+  const [selectedElementName, setSelectedElementName] = useState<string | undefined>();
+  const { theme } = useTheme();
+  const { comments, addComment, deleteComment, getAllComments } = useComments();
+  
+  // IFC Data from backend
+  const {
+    elements,
+    costs,
+    isLoading,
+    error,
+    visibleTypes,
+    setIsLoading,
+    handleParsed,
+    handleError,
+    handleTypeVisibilityChange,
+    showAllTypes,
+    hideAllTypes,
+  } = useIFCData();
+  
+  const highlighterRef = useRef<OBC.FragmentHighlighter | null>(null);
+  const dimensionsRef = useRef<SimpleDimensionTool | null>(null);
+  const modelObjectsRef = useRef<THREE.Object3D[]>([]);
+  const ifcLoaderRef = useRef<OBC.FragmentIfcLoader | null>(null);
+  
+  // Stan dla pinowania elementów
+  const [isPinMode, setIsPinMode] = useState(false);
+  const [selectedPinColor, setSelectedPinColor] = useState("#FF0000");
+  const [pinnedElements, setPinnedElements] = useState<Map<string, string>>(new Map());
+  const isPinModeRef = useRef(isPinMode);
+  const selectedPinColorRef = useRef(selectedPinColor);
+  
+  // Stan dla wymiarowania
+  const [isDimensionMode, setIsDimensionMode] = useState(false);
+  const [dimensionOrthogonal, setDimensionOrthogonal] = useState(false);
+  const [dimensionSnap, setDimensionSnap] = useState(true); // Domyślnie włączone
+  const [alignToEdgeMode, setAlignToEdgeMode] = useState<'none' | 'parallel' | 'perpendicular'>('none');
+  
+  // Stan dla wyszukiwania
+  const [showSearchPanel, setShowSearchPanel] = useState(false);
+  const loadedModelsRef = useRef<any[]>([]);
+  
+  // Stan dla selekcji i izolacji
+  const [showSelectionPanel, setShowSelectionPanel] = useState(false);
+  const [selectedElements, setSelectedElements] = useState<SelectedElement[]>([]);
+  const [isIsolated, setIsIsolated] = useState(false);
+  const hiddenFragmentsRef = useRef<Map<string, Set<number>>>(new Map());
+  const originalFragmentsRef = useRef<Map<string, any>>(new Map()); // Przechowuje oryginalne fragmenty przed splittem
+  const splitFragmentsRef = useRef<Map<string, THREE.Mesh[]>>(new Map()); // Przechowuje nowe podzielone fragmenty
+  const showSelectionPanelRef = useRef(showSelectionPanel);
+  const isCtrlPressedRef = useRef(false);
+  
+  // Stan dla przeciągania okienka IFCUploader
+  // Pozycja startowa w prawym górnym rogu (obliczona dynamicznie po załadowaniu)
+  const [uploaderPosition, setUploaderPosition] = useState({ x: window.innerWidth - 320, y: 20 });
+  const [isDraggingUploader, setIsDraggingUploader] = useState(false);
+  const dragStartPos = useRef({ x: 0, y: 0 });
+  const uploaderStartPos = useRef({ x: window.innerWidth - 320, y: 20 });
+  
+  useEffect(() => {
+    isPinModeRef.current = isPinMode;
+  }, [isPinMode]);
+  
+  useEffect(() => {
+    selectedPinColorRef.current = selectedPinColor;
+  }, [selectedPinColor]);
+  
+  useEffect(() => {
+    showSelectionPanelRef.current = showSelectionPanel;
+  }, [showSelectionPanel]);
+  
+  // Synchronizuj opcje wymiarowania z narzędziem
+  useEffect(() => {
+    if (dimensionsRef.current) {
+      dimensionsRef.current.orthogonalMode = dimensionOrthogonal;
+      console.log('📏 Orthogonal mode:', dimensionOrthogonal);
+    }
+  }, [dimensionOrthogonal]);
+  
+  useEffect(() => {
+    if (dimensionsRef.current) {
+      dimensionsRef.current.snapToPoints = dimensionSnap;
+      console.log('📏 Snap to points:', dimensionSnap);
+    }
+  }, [dimensionSnap]);
+  
+  useEffect(() => {
+    if (dimensionsRef.current) {
+      dimensionsRef.current.alignToEdgeMode = alignToEdgeMode;
+      dimensionsRef.current.resetReferenceEdge();
+      console.log('📏 Align to edge mode:', alignToEdgeMode);
+    }
+  }, [alignToEdgeMode]);
+  
+  // Animacja snap markera
+  useEffect(() => {
+    if (!isDimensionMode || !dimensionsRef.current) return;
+    
+    const animationInterval = setInterval(() => {
+      if (dimensionsRef.current) {
+        dimensionsRef.current.updateSnapMarker();
+      }
+    }, 50); // 20 FPS dla płynnej animacji
+    
+    return () => clearInterval(animationInterval);
+  }, [isDimensionMode]);
+  
+  // Dostępne kolory do pinowania - żywe, podstawowe kolory
+  const pinColors = [
+    { name: "Czerwony", color: "#FF0000" },
+    { name: "Niebieski", color: "#0000FF" },
+    { name: "Zielony", color: "#00FF00" },
+    { name: "Żółty", color: "#FFFF00" },
+    { name: "Pomarańczowy", color: "#FF6600" },
+    { name: "Fioletowy", color: "#9900FF" },
+  ];
+  
+  // Ref aby zawsze mieć dostęp do najnowszych komentarzy
+  const commentsRef = useRef(comments);
+  useEffect(() => {
+    commentsRef.current = comments;
+  }, [comments]);
+
+  // System historii akcji dla undo/redo
+  interface Action {
+    type: 'camera' | 'dimension_add' | 'dimension_delete';
+    data: any;
+    timestamp: number;
+  }
+  
+  interface CameraState {
+    position: THREE.Vector3;
+    target: THREE.Vector3;
+  }
+  
+  interface DimensionData {
+    group: THREE.Group;
+    start: THREE.Vector3;
+    end: THREE.Vector3;
+  }
+  
+  const actionHistory = useRef<Action[]>([]);
+  const historyIndex = useRef<number>(-1);
+  const isRestoringState = useRef<boolean>(false);
+
+  useEffect(() => {
+    if (!viewerContainerRef.current || viewerRef.current) return;
+
+    // --- UTWORZENIE GŁÓWNEGO VIEWERA ---
+    const viewer = new OBC.Components();
+    viewerRef.current = viewer;
+
+    // --- SCENA ---
+    const sceneComponent = new OBC.SimpleScene(viewer);
+    viewer.scene = sceneComponent;
+    const scene = sceneComponent.get();
+
+    // --- OŚWIETLENIE ---
+    // Ustaw światła - intensywność zostanie dostosowana przez useEffect z motywem
+    const ambientLight = new THREE.AmbientLight(0xE6E7E4, 1);
+    const directionalLight = new THREE.DirectionalLight(0xF9F9F9, 0.75);
+    directionalLight.position.set(10, 50, 10);
+    scene.add(ambientLight, directionalLight);
+    
+    // Ustaw początkowe tło - zostanie zaktualizowane przez useEffect z motywem
+    scene.background = new THREE.Color(0x202932);
+
+    // --- KONTENER RENDERA ---
+    const rendererComponent = new OBC.PostproductionRenderer(viewer, viewerContainerRef.current);
+    viewer.renderer = rendererComponent;
+
+    // --- KAMERA ---
+    const cameraComponent = new OBC.OrthoPerspectiveCamera(viewer);
+    viewer.camera = cameraComponent;
+    
+    // Włącz kontrolki kamery
+    if (cameraComponent.controls) {
+      cameraComponent.controls.enabled = true;
+      console.log("📷 Camera controls enabled");
+    }
+    
+    // Dodaj test listener aby sprawdzić czy eventy przechodzą do canvas
+    const canvas = viewerContainerRef.current.querySelector('canvas');
+    const testMouseDown = () => {
+      console.log('🖱️ Canvas mousedown event detected!');
+    };
+    const testMouseMove = () => {
+      console.log('🖱️ Canvas mousemove event detected!');
+    };
+    
+    // Czekaj aż canvas się pojawi
+    setTimeout(() => {
+      const canvas = viewerContainerRef.current?.querySelector('canvas');
+      if (canvas) {
+        canvas.addEventListener('mousedown', testMouseDown);
+        canvas.addEventListener('mousemove', testMouseMove);
+        console.log('🖱️ Test listeners attached to canvas');
+        
+        // Usuń test listenery po 5 sekundach
+        setTimeout(() => {
+          canvas.removeEventListener('mousedown', testMouseDown);
+          canvas.removeEventListener('mousemove', testMouseMove);
+          console.log('🖱️ Test listeners removed');
+        }, 5000);
+      }
+    }, 500);
+    
+    // Zapisz początkowy stan kamery
+    setTimeout(() => {
+      saveCameraState();
+      console.log("📷 Initial camera state saved");
+    }, 1000);
+    
+    // Dodaj listener na zmiany kamery (zapisz stan po każdej interakcji)
+    let cameraChangeTimeout: number | null = null;
+    cameraComponent.controls.addEventListener('controlend', () => {
+      // Użyj debounce aby nie zapisywać stanu zbyt często
+      if (cameraChangeTimeout) {
+        clearTimeout(cameraChangeTimeout);
+      }
+      cameraChangeTimeout = window.setTimeout(() => {
+        saveCameraState();
+      }, 300);
+    });
+
+    // --- RAYCASTER ---
+    const raycasterComponent = new OBC.SimpleRaycaster(viewer);
+    viewer.raycaster = raycasterComponent;
+
+    // --- INICJALIZACJA VIEWERA ---
+    viewer.init();
+    rendererComponent.postproduction.enabled = true;
+    
+    // Sprawdź czy canvas jest w kontenerze
+    setTimeout(() => {
+      if (viewerContainerRef.current) {
+        const canvas = viewerContainerRef.current.querySelector('canvas');
+        if (canvas) {
+          console.log('✅ Canvas found in container:', {
+            width: canvas.width,
+            height: canvas.height,
+            style: canvas.style.cssText,
+            pointerEvents: window.getComputedStyle(canvas).pointerEvents
+          });
+        } else {
+          console.error('❌ Canvas NOT found in container!');
+        }
+      }
+    }, 100);
+
+    // --- SIATKA (GRID) ---
+    new OBC.SimpleGrid(viewer, new THREE.Color(0x666666));
+
+    // --- ŁADOWANIE MODELU IFC ---
+    const ifcLoader = new OBC.FragmentIfcLoader(viewer);
+    ifcLoader.setup();
+    ifcLoaderRef.current = ifcLoader;
+
+    // --- PODŚWIETLENIE I PANEL WŁAŚCIWOŚCI ---
+    const highlighter = new OBC.FragmentHighlighter(viewer);
+    highlighter.setup();
+    
+    // Setup() już tworzy domyślne grupy highlight, więc nie trzeba ich dodawać ręcznie
+    // Wyłącz outline dla czystszego wyglądu
+    highlighter.outlineEnabled = false;
+    
+    highlighterRef.current = highlighter;
+
+    // --- NARZĘDZIE WYMIAROWANIA (własna implementacja) ---
+    const dimensions = new SimpleDimensionTool(scene, cameraComponent.get());
+    dimensionsRef.current = dimensions;
+    
+    // Callback wywoływany gdy wymiar jest tworzony (dla undo/redo)
+    dimensions.onMeasurementCreated = (dimensionData) => {
+      const action: Action = {
+        type: 'dimension_add',
+        data: dimensionData,
+        timestamp: Date.now(),
+      };
+      saveAction(action);
+      console.log('📏 Dimension saved to history');
+    };
+    
+    // Event listener dla ruchu myszy w trybie wymiarowania (podgląd)
+    // Tylko pokazuj podgląd gdy Shift jest wciśnięty
+    const handleDimensionMove = (event: MouseEvent) => {
+      if (!dimensions.enabled || modelObjectsRef.current.length === 0) return;
+      
+      // Tylko pokazuj podgląd gdy Shift jest wciśnięty
+      if (event.shiftKey) {
+        dimensions.handleMouseMove(event, modelObjectsRef.current);
+      } else {
+        // Bez Shift - wyczyść podgląd aby nie przeszkadzał
+        dimensions.clearPreviewAndSnap();
+      }
+    };
+    
+    // Stan dla zaznaczonego wymiaru do usunięcia
+    let selectedMeasurementToDelete: THREE.Group | null = null;
+    
+    // Zmienne dla wykrywania podwójnego kliknięcia i Shift
+    let lastClickTime = 0;
+    const doubleClickThreshold = 300; // ms
+    
+    // Obsługa kliknięć: Shift + klik = dodaj punkt, Shift + podwójny klik = zaznacz do usunięcia
+    const handleDimensionClickWithDelete = (event: MouseEvent) => {
+      if (!dimensions.enabled) return;
+      
+      // WAŻNE: Tylko reaguj gdy Shift jest wciśnięty!
+      // Bez Shift = pozwól kontrolkom kamery działać normalnie
+      if (!event.shiftKey) {
+        return; // Kamera może swobodnie działać
+      }
+      
+      const currentTime = Date.now();
+      const timeSinceLastClick = currentTime - lastClickTime;
+      
+      // Shift + Podwójne kliknięcie = zaznacz wymiar do usunięcia
+      if (timeSinceLastClick < doubleClickThreshold) {
+        console.log('🎯 Shift+Double-click detected - trying to select measurement for deletion');
+        event.stopPropagation();
+        event.preventDefault();
+        
+        // Wyczyść poprzednie zaznaczenie
+        if (selectedMeasurementToDelete) {
+          dimensions.highlightMeasurement(selectedMeasurementToDelete, false);
+        }
+        
+        selectedMeasurementToDelete = dimensions.handleRightClick(event, modelObjectsRef.current);
+        if (selectedMeasurementToDelete) {
+          console.log('✅ Measurement selected for deletion. Press Delete to remove.');
+          dimensions.highlightMeasurement(selectedMeasurementToDelete, true);
+        } else {
+          console.log('❌ No measurement found at click position');
+        }
+        
+        lastClickTime = 0; // Reset czasu
+        return; // Nie dodawaj punktu!
+      }
+      
+      // Shift + Pojedyncze kliknięcie = dodaj punkt wymiaru
+      lastClickTime = currentTime;
+      
+      // Małe opóźnienie aby sprawdzić czy to nie będzie podwójne kliknięcie
+      setTimeout(() => {
+        if (Date.now() - lastClickTime >= doubleClickThreshold && modelObjectsRef.current.length > 0) {
+          console.log('➕ Shift+click - adding dimension point');
+          dimensions.handleClick(event, modelObjectsRef.current);
+        }
+      }, doubleClickThreshold);
+    };
+    
+    // Event listener dla klawisza ESC (anulowanie bieżącego wymiaru) i Delete (usuwanie)
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Śledź Ctrl
+      if (event.key === 'Control' || event.ctrlKey) {
+        isCtrlPressedRef.current = true;
+      }
+      
+      if (dimensions.enabled) {
+        if (event.key === 'Escape') {
+          dimensions.cancelCurrentMeasurement();
+          if (selectedMeasurementToDelete) {
+            dimensions.highlightMeasurement(selectedMeasurementToDelete, false);
+          }
+          selectedMeasurementToDelete = null;
+          console.log('📏 Current measurement canceled');
+        } else if (event.key === 'Delete' && selectedMeasurementToDelete) {
+          // Zapisz dane wymiaru przed usunięciem (dla undo)
+          const dimensionData = dimensions.getMeasurementData(selectedMeasurementToDelete);
+          if (dimensionData) {
+            const action: Action = {
+              type: 'dimension_delete',
+              data: dimensionData,
+              timestamp: Date.now(),
+            };
+            saveAction(action);
+          }
+          
+          dimensions.deleteMeasurement(selectedMeasurementToDelete);
+          selectedMeasurementToDelete = null;
+          console.log('📏 Measurement deleted and saved to history');
+        }
+      }
+    };
+    
+    // Event listener dla puszczenia Ctrl
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === 'Control') {
+        isCtrlPressedRef.current = false;
+      }
+    };
+    
+    viewerContainerRef.current.addEventListener('click', handleDimensionClickWithDelete);
+    viewerContainerRef.current.addEventListener('mousemove', handleDimensionMove);
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('keyup', handleKeyUp);
+    console.log("📏 Simple dimension tool initialized");
+
+    // Pętla aktualizacji dla wymiarów (skalowanie etykiet względem kamery)
+    let animationFrameId: number;
+    const updateLoop = () => {
+      if (dimensions) {
+        dimensions.update();
+      }
+      animationFrameId = requestAnimationFrame(updateLoop);
+    };
+    updateLoop();
+
+    const propertiesProcessor = new OBC.IfcPropertiesProcessor(viewer);
+
+    // --- Po wczytaniu modelu ---
+    ifcLoader.onIfcLoaded.add(async (model) => {
+      // przetwarzanie właściwości
+      propertiesProcessor.process(model);
+      await highlighter.updateHighlight();
+      
+      // Zapisz model dla wyszukiwania
+      loadedModelsRef.current.push(model);
+      console.log(`🔍 Model loaded for search: ${loadedModelsRef.current.length} total models`);
+      
+      // Zapisz obiekty modelu dla narzędzia wymiarowania
+      const meshes: THREE.Object3D[] = [];
+      model.items.forEach((item: any) => {
+        if (item.mesh) {
+          meshes.push(item.mesh);
+        }
+      });
+      modelObjectsRef.current = meshes;
+      console.log(`📏 Loaded ${meshes.length} objects for dimension tool`);
+
+      // reagowanie na zaznaczenia
+      highlighter.events.select.onHighlight.add(async (selection) => {
+        const fragmentID = Object.keys(selection)[0];
+        const expressID = Number([...selection[fragmentID]][0]);
+        const elementIdStr = expressID.toString();
+        
+        // Jeśli Ctrl jest wciśnięty i panel selekcji jest otwarty, dodaj do selekcji
+        if (isCtrlPressedRef.current && showSelectionPanelRef.current) {
+          console.log("🎯 Ctrl+click - adding element to selection:", expressID);
+          addToSelection(expressID);
+          return; // Nie wykonuj innych akcji
+        }
+        
+        // Jeśli tryb pinowania jest aktywny, zapinuj element
+        if (isPinModeRef.current) {
+          console.log("📌 Pin mode active - pinning element:", elementIdStr);
+          
+          try {
+            const color = new THREE.Color(selectedPinColorRef.current);
+            console.log("📌 Selected color:", selectedPinColorRef.current, color);
+            
+            // Pobierz wszystkie fragmenty modelu
+            for (const fragID of Object.keys(selection)) {
+              console.log("📌 Processing fragment:", fragID);
+              
+              // Znajdź fragment w items modelu
+              const fragment = model.items.find((item: any) => item.id === fragID);
+              
+              if (fragment && fragment.mesh) {
+                console.log("📌 Found fragment mesh");
+                const mesh = fragment.mesh;
+                
+                // Sprawdź czy instanceColor istnieje, jeśli nie - stwórz
+                if (!mesh.instanceColor) {
+                  console.log("📌 Creating instanceColor buffer");
+                  const count = mesh.count;
+                  const colors = new Float32Array(count * 3);
+                  
+                  // Wypełnij domyślnym kolorem (biały)
+                  for (let i = 0; i < count; i++) {
+                    colors[i * 3] = 1;
+                    colors[i * 3 + 1] = 1;
+                    colors[i * 3 + 2] = 1;
+                  }
+                  
+                  mesh.instanceColor = new THREE.InstancedBufferAttribute(colors, 3);
+                  mesh.instanceColor.needsUpdate = true;
+                }
+                
+                // Upewnij się że materiał używa kolorów instancji
+                if (mesh.material) {
+                  const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                  materials.forEach((mat: any) => {
+                    if (mat && !mat.vertexColors) {
+                      mat.vertexColors = true;
+                      mat.needsUpdate = true;
+                      console.log("📌 Enabled vertexColors on material");
+                    }
+                  });
+                }
+                
+                // Ustaw kolor dla każdej instancji w tym fragmencie
+                const instanceIDs = selection[fragID];
+                console.log("📌 Instance IDs:", instanceIDs);
+                
+                for (const instanceID of instanceIDs) {
+                  const id = Number(instanceID);
+                  mesh.setColorAt(id, color);
+                  console.log(`📌 Set color for instance ${id}`);
+                }
+                
+                // Wymuszenie aktualizacji
+                mesh.instanceColor.needsUpdate = true;
+                console.log("📌 Updated instanceColor");
+              } else {
+                console.log("❌ Fragment or mesh not found");
+              }
+            }
+            
+            setPinnedElements(prev => {
+              const newMap = new Map(prev);
+              newMap.set(elementIdStr, selectedPinColorRef.current);
+              return newMap;
+            });
+            
+            console.log(`✅ Element ${elementIdStr} pinned with color ${selectedPinColorRef.current}`);
+          } catch (error) {
+            console.error("❌ Error pinning element:", error);
+          }
+          
+          return; // Nie pokazuj properties w trybie pinowania
+        }
+        
+        // Normalny tryb - pokaż properties
+        propertiesProcessor.renderProperties(model, expressID);
+        
+        // Zapisz ID zaznaczonego elementu dla komentarzy
+        setSelectedElementId(elementIdStr);
+        
+        // Spróbuj pobrać nazwę elementu
+        try {
+          const properties = await model.getProperties(expressID);
+          const name = properties?.Name?.value || properties?.type || `Element ${expressID}`;
+          setSelectedElementName(name);
+        } catch (error) {
+          setSelectedElementName(`Element ${expressID}`);
+        }
+
+        // Dodaj sekcję komentarzy do panelu Properties
+        setTimeout(() => {
+          addCommentsToPropertiesPanel(elementIdStr);
+        }, 500);
+      });
+    });
+
+    // --- TOOLBAR ---
+    const mainToolbar = new OBC.Toolbar(viewer);
+    mainToolbar.addChild(
+      ifcLoader.uiElement.get("main"),
+      propertiesProcessor.uiElement.get("main")
+    );
+    viewer.ui.addToolbar(mainToolbar);
+
+    // Cleanup function
+    return () => {
+      if (viewerContainerRef.current) {
+        viewerContainerRef.current.removeEventListener('click', handleDimensionClickWithDelete);
+        viewerContainerRef.current.removeEventListener('mousemove', handleDimensionMove);
+      }
+      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('keyup', handleKeyUp);
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
+      if (viewerRef.current) {
+        viewerRef.current.dispose();
+        viewerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Synchronizacja motywu z tłem viewera i oświetleniem
+  useEffect(() => {
+    // Małe opóźnienie aby upewnić się że viewer jest gotowy
+    const timer = setTimeout(() => {
+      if (!viewerRef.current) return;
+
+      const viewer = viewerRef.current;
+      const sceneComponent = viewer.scene as OBC.SimpleScene;
+      const scene = sceneComponent.get();
+
+      // Znajdź światła w scenie
+      const ambientLight = scene.children.find(
+        (child) => child instanceof THREE.AmbientLight
+      ) as THREE.AmbientLight | undefined;
+      
+      const directionalLight = scene.children.find(
+        (child) => child instanceof THREE.DirectionalLight
+      ) as THREE.DirectionalLight | undefined;
+
+      // Zmień kolor tła i intensywność świateł w zależności od motywu
+      if (theme === "dark") {
+        scene.background = new THREE.Color(0x202932); // Ciemny granatowy
+        // Tryb nocny - stonowane, ciemne oświetlenie
+        if (ambientLight) ambientLight.intensity = 0.6;
+        if (directionalLight) directionalLight.intensity = 0.5;
+      } else {
+        scene.background = new THREE.Color(0xE6E7E4); // Jasny szary
+        // Tryb dzienny - mocne, rozświetlone oświetlenie
+        if (ambientLight) ambientLight.intensity = 2.5;
+        if (directionalLight) directionalLight.intensity = 1.5;
+      }
+    }, 50);
+
+    return () => clearTimeout(timer);
+  }, [theme]);
+
+  // Zapisz stan kamery
+  // Funkcja do zapisywania akcji w historii
+  const saveAction = (action: Action) => {
+    if (isRestoringState.current) return;
+    
+    // Usuń wszystkie akcje po aktualnym indeksie (jeśli użytkownik zrobił undo i potem nową akcję)
+    actionHistory.current = actionHistory.current.slice(0, historyIndex.current + 1);
+    
+    // Dodaj nową akcję
+    actionHistory.current.push(action);
+    historyIndex.current = actionHistory.current.length - 1;
+    
+    console.log(`💾 Action saved: ${action.type}, history size:`, actionHistory.current.length);
+  };
+  
+  const saveCameraState = () => {
+    if (!viewerRef.current || isRestoringState.current) return;
+    
+    try {
+      const camera = viewerRef.current.camera as OBC.OrthoPerspectiveCamera;
+      if (!camera || !camera.controls || !camera.get) return;
+      
+      const controls = camera.controls;
+      const threeCamera = camera.get() as THREE.PerspectiveCamera;
+      
+      if (!threeCamera || !threeCamera.position) return;
+      
+      // Sprawdź czy getTarget zwraca prawidłową wartość
+      const targetVector = new THREE.Vector3();
+      const target = controls.getTarget ? controls.getTarget(targetVector) : targetVector;
+      
+      if (!target) return;
+      
+      const cameraState: CameraState = {
+        position: threeCamera.position.clone(),
+        target: target.clone(),
+      };
+      
+      const action: Action = {
+        type: 'camera',
+        data: cameraState,
+        timestamp: Date.now(),
+      };
+      
+      saveAction(action);
+    } catch (error) {
+      console.warn('⚠️ Could not save camera state:', error);
+    }
+  };
+
+  // Undo - cofnij ostatnią akcję
+  const handleUndo = () => {
+    if (historyIndex.current <= 0 || !viewerRef.current || !dimensionsRef.current) {
+      console.log("⚠️ Cannot undo - at the beginning of history");
+      return;
+    }
+    
+    historyIndex.current--;
+    const action = actionHistory.current[historyIndex.current];
+    
+    console.log(`⏪ Undo - restoring state to: ${action.type}`, historyIndex.current);
+    isRestoringState.current = true;
+    
+    // Przywróć stan w zależności od typu akcji
+    if (action.type === 'camera') {
+      const cameraState = action.data as CameraState;
+      // Sprawdź czy stan kamery jest prawidłowy
+      if (!cameraState || !cameraState.position || !cameraState.target) {
+        console.warn('⚠️ Invalid camera state in history');
+        isRestoringState.current = false;
+        return;
+      }
+      
+      const camera = viewerRef.current.camera as OBC.OrthoPerspectiveCamera;
+      if (!camera || !camera.get || !camera.controls) {
+        console.warn('⚠️ Camera not available for undo');
+        isRestoringState.current = false;
+        return;
+      }
+      
+      const threeCamera = camera.get() as THREE.PerspectiveCamera;
+      if (!threeCamera || !threeCamera.position) {
+        console.warn('⚠️ Three.js camera not available for undo');
+        isRestoringState.current = false;
+        return;
+      }
+      
+      threeCamera.position.copy(cameraState.position);
+      camera.controls.setLookAt(
+        cameraState.position.x,
+        cameraState.position.y,
+        cameraState.position.z,
+        cameraState.target.x,
+        cameraState.target.y,
+        cameraState.target.z,
+        false
+      );
+    } else if (action.type === 'dimension_add') {
+      // Cofnij dodanie wymiaru = usuń ostatni wymiar
+      const dimensionData = action.data as DimensionData;
+      dimensionsRef.current.deleteMeasurementSilent(dimensionData.group);
+      console.log('⏪ Dimension removed (undo add)');
+    } else if (action.type === 'dimension_delete') {
+      // Cofnij usunięcie wymiaru = dodaj wymiar z powrotem
+      const dimensionData = action.data as DimensionData;
+      dimensionsRef.current.restoreMeasurement(dimensionData);
+      console.log('⏪ Dimension restored (undo delete)');
+    }
+    
+    setTimeout(() => {
+      isRestoringState.current = false;
+    }, 100);
+  };
+
+  // Redo - przywróć cofniętą akcję
+  const handleRedo = () => {
+    if (historyIndex.current >= actionHistory.current.length - 1 || !viewerRef.current || !dimensionsRef.current) {
+      console.log("⚠️ Cannot redo - at the end of history");
+      return;
+    }
+    
+    historyIndex.current++;
+    const action = actionHistory.current[historyIndex.current];
+    
+    console.log(`⏩ Redo - applying action: ${action.type}`, historyIndex.current);
+    isRestoringState.current = true;
+    
+    // Zastosuj akcję ponownie
+    if (action.type === 'camera') {
+      const cameraState = action.data as CameraState;
+      // Sprawdź czy stan kamery jest prawidłowy
+      if (!cameraState || !cameraState.position || !cameraState.target) {
+        console.warn('⚠️ Invalid camera state in history');
+        isRestoringState.current = false;
+        return;
+      }
+      
+      const camera = viewerRef.current.camera as OBC.OrthoPerspectiveCamera;
+      if (!camera || !camera.get || !camera.controls) {
+        console.warn('⚠️ Camera not available for redo');
+        isRestoringState.current = false;
+        return;
+      }
+      
+      const threeCamera = camera.get() as THREE.PerspectiveCamera;
+      if (!threeCamera || !threeCamera.position) {
+        console.warn('⚠️ Three.js camera not available for redo');
+        isRestoringState.current = false;
+        return;
+      }
+      
+      threeCamera.position.copy(cameraState.position);
+      camera.controls.setLookAt(
+        cameraState.position.x,
+        cameraState.position.y,
+        cameraState.position.z,
+        cameraState.target.x,
+        cameraState.target.y,
+        cameraState.target.z,
+        false
+      );
+    } else if (action.type === 'dimension_add') {
+      // Ponów dodanie wymiaru
+      const dimensionData = action.data as DimensionData;
+      dimensionsRef.current.restoreMeasurement(dimensionData);
+      console.log('⏩ Dimension restored (redo add)');
+    } else if (action.type === 'dimension_delete') {
+      // Ponów usunięcie wymiaru
+      const dimensionData = action.data as DimensionData;
+      dimensionsRef.current.deleteMeasurementSilent(dimensionData.group);
+      console.log('⏩ Dimension removed (redo delete)');
+    }
+    
+    setTimeout(() => {
+      isRestoringState.current = false;
+    }, 100);
+  };
+
+  // Funkcja wyszukiwania elementów
+  const searchElements = async (query: string) => {
+    const results: Array<{
+      expressID: number;
+      name: string;
+      type: string;
+      properties: Record<string, any>;
+    }> = [];
+
+    const lowerQuery = query.toLowerCase();
+
+    for (const model of loadedModelsRef.current) {
+      try {
+        // Pobierz wszystkie ID elementów z modelu
+        const allIDs = await model.getAllPropertiesOfType(0); // 0 = wszystkie typy
+        
+        if (!allIDs || Object.keys(allIDs).length === 0) {
+          // Jeśli getAllPropertiesOfType nie działa, spróbuj iterować przez fragmenty
+          model.items.forEach((fragment: any) => {
+            if (fragment.ids) {
+              fragment.ids.forEach(async (id: number) => {
+                try {
+                  const props = await model.getProperties(id);
+                  if (props) {
+                    const name = props.Name?.value || props.type || `Element ${id}`;
+                    const type = props.type || 'Unknown';
+                    
+                    // Sprawdź czy pasuje do zapytania
+                    if (
+                      name.toLowerCase().includes(lowerQuery) ||
+                      type.toLowerCase().includes(lowerQuery) ||
+                      id.toString().includes(lowerQuery)
+                    ) {
+                      results.push({
+                        expressID: id,
+                        name,
+                        type,
+                        properties: {
+                          Name: name,
+                          Type: type,
+                          GlobalId: props.GlobalId?.value || 'N/A',
+                          ObjectType: props.ObjectType?.value || 'N/A',
+                        }
+                      });
+                    }
+                  }
+                } catch (error) {
+                  // Ignoruj błędy dla pojedynczych elementów
+                }
+              });
+            }
+          });
+        } else {
+          // Przeszukaj wszystkie właściwości
+          for (const [idStr, props] of Object.entries(allIDs)) {
+            const id = parseInt(idStr);
+            const properties = props as any;
+            
+            const name = properties.Name?.value || properties.type || `Element ${id}`;
+            const type = properties.type || 'Unknown';
+            
+            // Sprawdź czy pasuje do zapytania
+            if (
+              name.toLowerCase().includes(lowerQuery) ||
+              type.toLowerCase().includes(lowerQuery) ||
+              id.toString().includes(lowerQuery) ||
+              (properties.GlobalId?.value || '').toLowerCase().includes(lowerQuery)
+            ) {
+              results.push({
+                expressID: id,
+                name,
+                type,
+                properties: {
+                  Name: name,
+                  Type: type,
+                  GlobalId: properties.GlobalId?.value || 'N/A',
+                  ObjectType: properties.ObjectType?.value || 'N/A',
+                }
+              });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error searching in model:', error);
+      }
+    }
+
+    console.log(`🔍 Found ${results.length} results for query: "${query}"`);
+    return results;
+  };
+
+  // Funkcja obsługi wyboru elementu z wyników wyszukiwania
+  const handleSearchSelect = async (expressID: number) => {
+    if (!highlighterRef.current || loadedModelsRef.current.length === 0) return;
+
+    try {
+      const highlighter = highlighterRef.current;
+      
+      // Znajdź fragment zawierający ten element
+      let foundFragment = null;
+      for (const model of loadedModelsRef.current) {
+        for (const fragment of model.items) {
+          if (fragment.ids && fragment.ids.includes(expressID)) {
+            foundFragment = fragment;
+            break;
+          }
+        }
+        if (foundFragment) break;
+      }
+
+      if (foundFragment) {
+        // Wyczyść poprzednie zaznaczenie
+        highlighter.clear();
+        
+        // Zaznacz element - użyj właściwego formatu FragmentIdMap
+        const fragmentIdMap: { [key: string]: Set<number> } = {
+          [foundFragment.fragment.id]: new Set([expressID])
+        };
+        // Użyj domyślnej grupy (pusty string)
+        await highlighter.highlightByID('', fragmentIdMap);
+        
+        // Pobierz nazwę elementu i wyświetl właściwości
+        const model = foundFragment.fragment.mesh.parent;
+        const properties = await model.getProperties(expressID);
+        const name = properties?.Name?.value || properties?.type || `Element ${expressID}`;
+        
+        setSelectedElementId(expressID.toString());
+        setSelectedElementName(name);
+        
+        console.log(`🔍 Selected element: ${name} (ID: ${expressID})`);
+      }
+    } catch (error) {
+      console.error('Error selecting search result:', error);
+    }
+  };
+
+  // Funkcja do splittingu fragmentu na dwie części (wybrane i niewybrane)
+  const splitFragment = (
+    originalMesh: THREE.InstancedMesh,
+    allIDs: number[],
+    idsToShow: Set<number>,
+    idsToHide: Set<number>,
+    fragmentId: string
+  ): { visibleMesh: THREE.InstancedMesh | null; hiddenMesh: THREE.InstancedMesh | null } => {
+    try {
+      console.log(`🔨 Splitting fragment ${fragmentId}: ${idsToShow.size} visible, ${idsToHide.size} hidden`);
+      
+      const geometry = originalMesh.geometry;
+      const material = originalMesh.material;
+      
+      // Stwórz mesh dla widocznych elementów
+      let visibleMesh: THREE.InstancedMesh | null = null;
+      if (idsToShow.size > 0) {
+        visibleMesh = new THREE.InstancedMesh(geometry, material, idsToShow.size);
+        visibleMesh.frustumCulled = false;
+        
+        let visibleIndex = 0;
+        const matrix = new THREE.Matrix4();
+        
+        allIDs.forEach((id, originalIndex) => {
+          if (idsToShow.has(id)) {
+            originalMesh.getMatrixAt(originalIndex, matrix);
+            visibleMesh!.setMatrixAt(visibleIndex, matrix);
+            
+            // Kopiuj także kolor jeśli istnieje
+            if (originalMesh.instanceColor) {
+              const r = originalMesh.instanceColor.getX(originalIndex);
+              const g = originalMesh.instanceColor.getY(originalIndex);
+              const b = originalMesh.instanceColor.getZ(originalIndex);
+              
+              if (!visibleMesh!.instanceColor) {
+                const colors = new Float32Array(idsToShow.size * 3);
+                visibleMesh!.instanceColor = new THREE.InstancedBufferAttribute(colors, 3);
+              }
+              visibleMesh!.instanceColor.setXYZ(visibleIndex, r, g, b);
+            }
+            
+            visibleIndex++;
+          }
+        });
+        
+        visibleMesh.instanceMatrix.needsUpdate = true;
+        if (visibleMesh.instanceColor) {
+          visibleMesh.instanceColor.needsUpdate = true;
+        }
+        
+        console.log(`✅ Created visible mesh with ${idsToShow.size} instances`);
+      }
+      
+      // Stwórz mesh dla ukrytych elementów (będzie ukryty)
+      let hiddenMesh: THREE.InstancedMesh | null = null;
+      if (idsToHide.size > 0) {
+        hiddenMesh = new THREE.InstancedMesh(geometry, material, idsToHide.size);
+        hiddenMesh.visible = false; // Od razu ukryty
+        hiddenMesh.frustumCulled = false;
+        
+        let hiddenIndex = 0;
+        const matrix = new THREE.Matrix4();
+        
+        allIDs.forEach((id, originalIndex) => {
+          if (idsToHide.has(id)) {
+            originalMesh.getMatrixAt(originalIndex, matrix);
+            hiddenMesh!.setMatrixAt(hiddenIndex, matrix);
+            
+            if (originalMesh.instanceColor) {
+              const r = originalMesh.instanceColor.getX(originalIndex);
+              const g = originalMesh.instanceColor.getY(originalIndex);
+              const b = originalMesh.instanceColor.getZ(originalIndex);
+              
+              if (!hiddenMesh!.instanceColor) {
+                const colors = new Float32Array(idsToHide.size * 3);
+                hiddenMesh!.instanceColor = new THREE.InstancedBufferAttribute(colors, 3);
+              }
+              hiddenMesh!.instanceColor.setXYZ(hiddenIndex, r, g, b);
+            }
+            
+            hiddenIndex++;
+          }
+        });
+        
+        hiddenMesh.instanceMatrix.needsUpdate = true;
+        if (hiddenMesh.instanceColor) {
+          hiddenMesh.instanceColor.needsUpdate = true;
+        }
+        
+        console.log(`✅ Created hidden mesh with ${idsToHide.size} instances (will be invisible)`);
+      }
+      
+      return { visibleMesh, hiddenMesh };
+    } catch (error) {
+      console.error(`❌ Error splitting fragment ${fragmentId}:`, error);
+      return { visibleMesh: null, hiddenMesh: null };
+    }
+  };
+
+  // Funkcje zarządzania selekcją
+  const addToSelection = async (expressID: number) => {
+    // Sprawdź czy element już jest w selekcji
+    if (selectedElements.some(el => el.expressID === expressID)) {
+      console.log('Element already in selection:', expressID);
+      return;
+    }
+
+    // Pobierz informacje o elemencie
+    let elementInfo: SelectedElement | null = null;
+    
+    for (const model of loadedModelsRef.current) {
+      try {
+        const properties = await model.getProperties(expressID);
+        if (properties) {
+          elementInfo = {
+            expressID,
+            name: properties.Name?.value || properties.type || `Element ${expressID}`,
+            type: properties.type || 'Unknown',
+          };
+          break;
+        }
+      } catch (error) {
+        // Próbuj następny model
+      }
+    }
+
+    if (elementInfo) {
+      setSelectedElements(prev => [...prev, elementInfo!]);
+      console.log('✅ Added to selection:', elementInfo);
+    }
+  };
+
+  const removeFromSelection = (expressID: number) => {
+    setSelectedElements(prev => prev.filter(el => el.expressID !== expressID));
+    console.log('❌ Removed from selection:', expressID);
+  };
+
+  const clearSelection = () => {
+    setSelectedElements([]);
+    console.log('🗑️ Cleared selection');
+  };
+
+  const isolateElements = async () => {
+    if (!viewerRef.current || selectedElements.length === 0) return;
+
+    try {
+      const selectedIDs = new Set(selectedElements.map(el => el.expressID));
+      
+      console.log('🔍 Starting isolation for', selectedElements.length, 'elements');
+      console.log('Selected IDs:', Array.from(selectedIDs));
+      
+      // Przejdź przez wszystkie modele i fragmenty
+      for (const model of loadedModelsRef.current) {
+        console.log('Processing model with', model.items.length, 'fragments');
+        
+        for (const item of model.items) {
+          // item bezpośrednio ma mesh, id, ids (nie ma zagnieżdżonego fragment)
+          if (!item || !item.mesh) {
+            console.log('Skipping item without mesh');
+            continue;
+          }
+          
+          const mesh = item.mesh;
+          const fragmentId = item.id;
+          const allIDs = item.ids || [];
+          
+          console.log(`Fragment ${fragmentId} has ${allIDs.length} elements`);
+          
+          // Sprawdź które ID powinny być ukryte
+          const idsToHide = new Set<number>();
+          const idsToShow = new Set<number>();
+          
+          allIDs.forEach((id: number) => {
+            if (selectedIDs.has(id)) {
+              idsToShow.add(id);
+            } else {
+              idsToHide.add(id);
+            }
+          });
+          
+          console.log(`Fragment ${fragmentId}: hiding ${idsToHide.size}, showing ${idsToShow.size}`);
+          
+          // Jeśli wszystkie elementy mają być ukryte, ukryj cały mesh
+          if (idsToShow.size === 0) {
+            mesh.visible = false;
+            hiddenFragmentsRef.current.set(fragmentId, new Set(allIDs));
+            console.log(`✅ Hidden entire mesh ${fragmentId}`);
+          }
+          // Jeśli wszystkie elementy mają być widoczne, pokaż mesh
+          else if (idsToHide.size === 0) {
+            mesh.visible = true;
+            console.log(`✅ Showing entire mesh ${fragmentId}`);
+          }
+          // Jeśli część ma być ukryta - SPLIT fragment na dwie części
+          else {
+            console.log(`🔨 Partial hiding in fragment ${fragmentId} - splitting into visible/hidden meshes`);
+            
+            // Zapisz oryginalny fragment jeśli jeszcze nie zapisano
+            if (!originalFragmentsRef.current.has(fragmentId)) {
+              originalFragmentsRef.current.set(fragmentId, {
+                mesh: mesh,
+                parent: mesh.parent,
+                visible: mesh.visible
+              });
+              console.log(`💾 Saved original fragment ${fragmentId}`);
+            }
+            
+            // Podziel fragment na widoczny i ukryty
+            const { visibleMesh, hiddenMesh } = splitFragment(
+              mesh,
+              allIDs,
+              idsToShow,
+              idsToHide,
+              fragmentId
+            );
+            
+            if (visibleMesh || hiddenMesh) {
+              // Ukryj oryginalny mesh
+              mesh.visible = false;
+              
+              // Dodaj nowe meshe do sceny (w tym samym miejscu co oryginalny)
+              const parent = mesh.parent;
+              const newMeshes: THREE.Mesh[] = [];
+              
+              if (visibleMesh && parent) {
+                parent.add(visibleMesh);
+                newMeshes.push(visibleMesh);
+                console.log(`✅ Added visible mesh to scene`);
+              }
+              
+              if (hiddenMesh && parent) {
+                parent.add(hiddenMesh);
+                newMeshes.push(hiddenMesh);
+                console.log(`✅ Added hidden mesh to scene (invisible)`);
+              }
+              
+              // Zapisz nowe meshe do późniejszego usunięcia
+              splitFragmentsRef.current.set(fragmentId, newMeshes);
+              hiddenFragmentsRef.current.set(fragmentId, idsToHide);
+              
+              console.log(`✅ Fragment ${fragmentId} successfully split!`);
+            } else {
+              console.error(`❌ Failed to split fragment ${fragmentId}`);
+              // Fallback - ukryj cały mesh
+              mesh.visible = false;
+            }
+          }
+        }
+      }
+      
+      setIsIsolated(true);
+      console.log('✅ Isolation complete');
+    } catch (error) {
+      console.error('❌ Error isolating elements:', error);
+    }
+  };
+
+  const unisolateElements = async () => {
+    if (!viewerRef.current) return;
+
+    try {
+      console.log('👁️ Starting unisolation - restoring all elements');
+      
+      // Najpierw usuń wszystkie podzielone meshe i przywróć oryginalne
+      splitFragmentsRef.current.forEach((splitMeshes, fragmentId) => {
+        console.log(`🧹 Cleaning up split meshes for fragment ${fragmentId}`);
+        
+        // Usuń podzielone meshe ze sceny
+        splitMeshes.forEach(mesh => {
+          if (mesh.parent) {
+            mesh.parent.remove(mesh);
+          }
+          // Nie dispose geometry i material bo są współdzielone z oryginalnym
+          console.log(`🗑️ Removed split mesh from scene`);
+        });
+        
+        // Przywróć oryginalny fragment
+        const originalFragment = originalFragmentsRef.current.get(fragmentId);
+        if (originalFragment) {
+          originalFragment.mesh.visible = originalFragment.visible;
+          console.log(`✅ Restored original fragment ${fragmentId}`);
+        }
+      });
+      
+      // Przywróć widoczność wszystkich pozostałych elementów
+      for (const model of loadedModelsRef.current) {
+        for (const item of model.items) {
+          if (!item || !item.mesh) continue;
+          
+          const mesh = item.mesh;
+          const fragmentId = item.id;
+          
+          // Pokaż mesh (może był ukryty jako pełny fragment)
+          mesh.visible = true;
+          
+          console.log(`✅ Showed fragment ${fragmentId}`);
+        }
+      }
+      
+      // Wyczyść wszystkie referencje
+      hiddenFragmentsRef.current.clear();
+      originalFragmentsRef.current.clear();
+      splitFragmentsRef.current.clear();
+      
+      setIsIsolated(false);
+      console.log('✅ Unisolation complete - all elements visible');
+    } catch (error) {
+      console.error('❌ Error unisolating elements:', error);
+    }
+  };
+
+  const handleSelectionElementClick = async (expressID: number) => {
+    // Podświetl element w modelu
+    if (!highlighterRef.current || loadedModelsRef.current.length === 0) return;
+
+    try {
+      const highlighter = highlighterRef.current;
+      
+      // Znajdź fragment zawierający ten element
+      let foundFragment = null;
+      for (const model of loadedModelsRef.current) {
+        for (const fragment of model.items) {
+          if (fragment.ids && fragment.ids.includes(expressID)) {
+            foundFragment = fragment;
+            break;
+          }
+        }
+        if (foundFragment) break;
+      }
+
+      if (foundFragment) {
+        highlighter.clear();
+        const fragmentIdMap: { [key: string]: Set<number> } = {
+          [foundFragment.fragment.id]: new Set([expressID])
+        };
+        await highlighter.highlightByID('', fragmentIdMap);
+      }
+    } catch (error) {
+      console.error('Error highlighting element from selection:', error);
+    }
+  };
+
+  const handleActionSelect = (action: string) => {
+    setActiveAction(action);
+    console.log("Selected action:", action);
+    
+    // Obsługa przycisku Comment
+    if (action === "comment") {
+      setShowCommentPanel(true);
+      console.log("💬 Comment panel enabled");
+      return;
+    }
+    
+    // Wyłącz panel komentarzy gdy wybrana jest inna akcja lub move
+    if (showCommentPanel && action !== "comment") {
+      setShowCommentPanel(false);
+      console.log("💬 Comment panel disabled");
+    }
+    
+    // Obsługa Undo/Redo
+    if (action === "undo") {
+      handleUndo();
+      return;
+    }
+    
+    if (action === "redo") {
+      handleRedo();
+      return;
+    }
+    
+    // Obsługa Pin
+    if (action === "pin") {
+      setIsPinMode(true);
+      console.log("📌 Pin mode enabled");
+      return;
+    }
+    
+    // Wyłącz pin mode gdy wybrana jest inna akcja lub move
+    if (isPinMode && action !== "pin") {
+      setIsPinMode(false);
+      console.log("📌 Pin mode disabled");
+    }
+    
+    // Obsługa Dimension (wymiarowanie)
+    if (action === "dimension") {
+      setIsDimensionMode(true);
+      
+      if (dimensionsRef.current) {
+        dimensionsRef.current.enable();
+        // Wyłącz pin mode jeśli jest aktywny
+        setIsPinMode(false);
+      }
+      console.log("📏 Dimension mode enabled");
+      return;
+    }
+    
+    // Wyłącz dimension mode gdy wybrana jest inna akcja lub move
+    if (isDimensionMode && action !== "dimension") {
+      setIsDimensionMode(false);
+      if (dimensionsRef.current) {
+        dimensionsRef.current.disable();
+      }
+      console.log("📏 Dimension mode disabled");
+    }
+    
+    // Obsługa Search (wyszukiwanie)
+    if (action === "search") {
+      setShowSearchPanel(true);
+      console.log("🔍 Search panel enabled");
+      return;
+    }
+    
+    // Wyłącz panel wyszukiwania gdy wybrana jest inna akcja lub move
+    if (showSearchPanel && action !== "search") {
+      setShowSearchPanel(false);
+      console.log("🔍 Search panel disabled");
+    }
+    
+    // Obsługa Selection (selekcja i izolacja)
+    if (action === "selection") {
+      setShowSelectionPanel(true);
+      console.log("🎯 Selection panel enabled");
+      return;
+    }
+    
+    // Wyłącz panel selekcji gdy wybrana jest inna akcja lub move
+    if (showSelectionPanel && action !== "selection") {
+      setShowSelectionPanel(false);
+      console.log("🎯 Selection panel disabled");
+    }
+    
+    // TODO: Implement other action handlers
+    // - camera: capture screenshots
+  };
+
+  const handleAddComment = (text: string, elementId?: string, elementName?: string) => {
+    addComment(text, elementId, elementName);
+    
+    // Odśwież sekcję komentarzy w Properties jeśli dodano komentarz do zaznaczonego elementu
+    if (elementId) {
+      setTimeout(() => {
+        addCommentsToPropertiesPanel(elementId);
+      }, 100);
+    }
+  };
+
+  const handleDeleteComment = (commentId: string) => {
+    deleteComment(commentId);
+    
+    // Odśwież sekcję komentarzy w Properties po usunięciu
+    if (selectedElementId) {
+      setTimeout(() => {
+        addCommentsToPropertiesPanel(selectedElementId);
+      }, 100);
+    }
+  };
+
+  const handleCloseCommentPanel = () => {
+    setShowCommentPanel(false);
+  };
+
+  const addCommentsToPropertiesPanel = (elementId: string) => {
+    // Szukaj panelu Properties
+    const selectors = [
+      '[data-tooeen-name="properties"]',
+      '.properties-panel',
+      '#properties',
+      '[class*="properties"]',
+      '[class*="Properties"]',
+      'div[style*="position"]'
+    ];
+    
+    let propertiesPanel: Element | null = null;
+    
+    for (const selector of selectors) {
+      const found = document.querySelector(selector);
+      if (found) {
+        propertiesPanel = found;
+        break;
+      }
+    }
+    
+    // Jeśli nie znaleziono standardowych selektorów, szukaj po zawartości tekstu
+    if (!propertiesPanel) {
+      const allDivs = Array.from(document.querySelectorAll('div'));
+      const possiblePanel = allDivs.find(div => {
+        const text = div.textContent || '';
+        return text.includes('Element Properties') || 
+               text.includes('BEAM') || 
+               text.includes('IfcBeam') ||
+               text.includes('Properties');
+      });
+      
+      if (possiblePanel) {
+        propertiesPanel = possiblePanel;
+      } else {
+        return; // Nie znaleziono panelu Properties
+      }
+    }
+
+    // Usuń poprzednią sekcję komentarzy jeśli istnieje
+    const existingCommentsSection = propertiesPanel.querySelector('.custom-comments-section');
+    if (existingCommentsSection) {
+      existingCommentsSection.remove();
+    }
+    
+    // Pobierz komentarze dla tego elementu - używamy ref aby mieć najnowsze dane
+    const elementComments = commentsRef.current.filter((comment) => comment.elementId === elementId);
+    
+    // Utwórz sekcję komentarzy
+    try {
+      const commentsSection = document.createElement('div');
+      commentsSection.className = 'custom-comments-section';
+      commentsSection.style.cssText = `
+        margin-top: 16px;
+        padding: 12px;
+        background-color: hsl(var(--muted) / 0.3);
+        border: 1px solid hsl(var(--border));
+        border-radius: 8px;
+      `;
+
+      // Nagłówek sekcji z możliwością rozwijania/zwijania
+      const header = document.createElement('div');
+    header.style.cssText = `
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 0px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid hsl(var(--border));
+      font-weight: 600;
+      font-size: 14px;
+      color: hsl(var(--foreground));
+      cursor: pointer;
+      user-select: none;
+    `;
+      
+      const arrowIcon = document.createElement('span');
+      arrowIcon.innerHTML = '▼';
+      arrowIcon.style.cssText = `
+        transition: transform 0.2s;
+        font-size: 10px;
+        color: hsl(var(--muted-foreground));
+      `;
+      
+      header.innerHTML = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: hsl(var(--primary))">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        </svg>
+        Komentarze (${elementComments.length})
+        <span style="font-size: 10px; color: hsl(var(--muted-foreground)); margin-left: 8px;">ID: ${elementId}</span>
+      `;
+      header.prepend(arrowIcon);
+      commentsSection.appendChild(header);
+      
+      // Kontener na zawartość komentarzy
+      const contentContainer = document.createElement('div');
+      contentContainer.style.cssText = `
+        margin-top: 12px;
+        display: none;
+      `;
+      
+      // Funkcja rozwijania/zwijania
+      let isExpanded = false;
+      header.addEventListener('click', () => {
+        isExpanded = !isExpanded;
+        contentContainer.style.display = isExpanded ? 'block' : 'none';
+        arrowIcon.style.transform = isExpanded ? 'rotate(180deg)' : 'rotate(0deg)';
+      });
+
+      // Lista komentarzy lub komunikat o braku komentarzy
+      if (elementComments.length > 0) {
+        elementComments.forEach((comment) => {
+          const commentDiv = document.createElement('div');
+          commentDiv.style.cssText = `
+            background-color: hsl(var(--background));
+            padding: 8px;
+            margin-bottom: 8px;
+            border-radius: 6px;
+            border: 1px solid hsl(var(--border) / 0.5);
+          `;
+
+          const date = new Date(comment.timestamp);
+          const dateStr = date.toLocaleString("pl-PL", {
+            day: "2-digit",
+            month: "2-digit",
+            year: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+
+          commentDiv.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 4px;">
+              <span style="font-size: 11px; color: hsl(var(--muted-foreground));">${dateStr}</span>
+              <button 
+                class="delete-comment-btn" 
+                data-comment-id="${comment.id}"
+                style="
+                  background: none;
+                  border: none;
+                  cursor: pointer;
+                  padding: 2px;
+                  color: hsl(var(--muted-foreground));
+                  transition: color 0.2s;
+                "
+                onmouseover="this.style.color='hsl(var(--destructive))'"
+                onmouseout="this.style.color='hsl(var(--muted-foreground))'"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 6h18"></path>
+                  <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path>
+                  <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path>
+                </svg>
+              </button>
+            </div>
+            <p style="font-size: 13px; color: hsl(var(--foreground)); white-space: pre-wrap; word-break: break-word;">${comment.text}</p>
+          `;
+
+          // Dodaj event listener do przycisku usuwania
+          const deleteBtn = commentDiv.querySelector('.delete-comment-btn');
+          if (deleteBtn) {
+            deleteBtn.addEventListener('click', (e) => {
+              e.stopPropagation();
+              handleDeleteComment(comment.id);
+              // Odśwież sekcję
+              setTimeout(() => addCommentsToPropertiesPanel(elementId), 50);
+            });
+          }
+
+          contentContainer.appendChild(commentDiv);
+        });
+      } else {
+        // Brak komentarzy - pokaż komunikat
+        const emptyState = document.createElement('div');
+        emptyState.style.cssText = `
+          text-align: center;
+          padding: 16px 8px;
+          color: hsl(var(--muted-foreground));
+          font-size: 13px;
+        `;
+        emptyState.innerHTML = `
+          <p style="margin-bottom: 8px;">Brak komentarzy dla tego elementu</p>
+        `;
+        contentContainer.appendChild(emptyState);
+      }
+
+      // Dodaj hint o dodawaniu komentarzy
+      const hint = document.createElement('p');
+      hint.style.cssText = `
+        font-size: 11px;
+        color: hsl(var(--muted-foreground));
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid hsl(var(--border) / 0.5);
+      `;
+      hint.textContent = elementComments.length > 0 
+        ? 'Otwórz panel komentarzy 💬 aby dodać więcej' 
+        : 'Kliknij ikonę 💬 na pasku narzędzi aby dodać komentarz';
+      contentContainer.appendChild(hint);
+      
+      // Dodaj kontener z zawartością do sekcji komentarzy
+      commentsSection.appendChild(contentContainer);
+
+      // Dodaj sekcję do panelu Properties
+      propertiesPanel.appendChild(commentsSection);
+      
+    } catch (error) {
+      console.error("Error adding comments section to properties panel:", error);
+    }
+  };
+
+  const handleCommentClick = async (elementId: string) => {
+    console.log("Comment clicked, highlighting element:", elementId);
+    
+    if (!viewerRef.current || !highlighterRef.current) {
+      console.log("Viewer or highlighter not ready");
+      return;
+    }
+
+    try {
+      const viewer = viewerRef.current;
+      const highlighter = highlighterRef.current;
+      const expressID = parseInt(elementId);
+
+      // Pobierz wszystkie fragmenty z modelu
+      const fragments = Object.values(viewer.scene?.get()?.children || [])
+        .filter((child: any) => child.fragment);
+
+      // Znajdź fragment zawierający ten element
+      for (const fragment of fragments as any[]) {
+        if (fragment.fragment) {
+          const ids = fragment.fragment.ids;
+          if (ids && ids.includes(expressID)) {
+            // Podświetl element - użyj Set zamiast Array
+            const fragmentIdMap: { [key: string]: Set<number> } = {
+              [fragment.fragment.id]: new Set([expressID])
+            };
+            await highlighter.highlightByID("", fragmentIdMap);
+            
+            // Zaktualizuj stan zaznaczonego elementu
+            setSelectedElementId(elementId);
+            
+            // Pobierz nazwę elementu
+            try {
+              const model = fragment.fragment.mesh.parent;
+              const properties = await model.getProperties(expressID);
+              const name = properties?.Name?.value || properties?.type || `Element ${expressID}`;
+              setSelectedElementName(name);
+            } catch (error) {
+              setSelectedElementName(`Element ${expressID}`);
+            }
+            
+            console.log("Element highlighted successfully");
+            break;
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error highlighting element:", error);
+    }
+  };
+
+  // Funkcja do lokalnego ładowania pliku IFC (bez backendu)
+  const handleLocalFileLoad = async (file: File) => {
+    if (!ifcLoaderRef.current || !viewerRef.current) {
+      console.error('IFC Loader or Viewer not initialized');
+      handleError('Viewer nie jest jeszcze gotowy. Spróbuj ponownie za chwilę.');
+      return;
+    }
+
+    try {
+      setIsLoading(true);
+      console.log('🚀 Loading IFC file locally:', file.name);
+      
+      // Przeczytaj plik jako ArrayBuffer
+      const arrayBuffer = await file.arrayBuffer();
+      const data = new Uint8Array(arrayBuffer);
+      
+      console.log('📦 File data prepared:', data.length, 'bytes');
+      
+      // Załaduj plik przez OpenBIM Components
+      const model = await ifcLoaderRef.current.load(data);
+      
+      console.log('✅ IFC file loaded successfully:', model);
+      
+      // Dodaj model do loadedModelsRef dla funkcji wyszukiwania
+      loadedModelsRef.current.push(model);
+      
+      // Pobierz fragmenty (meshes) z modelu i dodaj do listy obiektów dla narzędzi
+      const viewer = viewerRef.current;
+      const scene = viewer.scene?.get();
+      
+      if (scene) {
+        // Zbierz wszystkie meshe z fragmentów
+        const meshes: THREE.Object3D[] = [];
+        scene.traverse((child: any) => {
+          if (child.isMesh && child.geometry) {
+            meshes.push(child);
+          }
+        });
+        
+        // Aktualizuj modelObjectsRef dla narzędzi wymiarowania
+        modelObjectsRef.current = meshes;
+        console.log(`📐 Loaded ${meshes.length} objects for dimension tool`);
+        
+        // Dopasuj kamerę do modelu
+        if (viewer.camera && meshes.length > 0) {
+          try {
+            // Oblicz bounding box całego modelu
+            const box = new THREE.Box3();
+            meshes.forEach(mesh => {
+              try {
+                const meshBox = new THREE.Box3().setFromObject(mesh);
+                if (meshBox && !box.isEmpty() || !meshBox.isEmpty()) {
+                  box.union(meshBox);
+                }
+              } catch (err) {
+                console.warn('Could not add mesh to bounding box:', err);
+              }
+            });
+            
+            // Sprawdź czy box jest prawidłowy
+            if (box.isEmpty()) {
+              throw new Error('Bounding box is empty');
+            }
+            
+            // Oblicz środek i rozmiar
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            const size = new THREE.Vector3();
+            box.getSize(size);
+            
+            // Sprawdź czy center i size są prawidłowe
+            if (!center || isNaN(center.x) || isNaN(center.y) || isNaN(center.z)) {
+              throw new Error('Invalid center coordinates');
+            }
+            
+            const maxDim = Math.max(size.x, size.y, size.z);
+            if (maxDim === 0 || isNaN(maxDim)) {
+              throw new Error('Invalid model dimensions');
+            }
+            
+            // Ustaw kamerę - dla OrthoPerspectiveCamera
+            const cameraComponent = viewer.camera as any;
+            if (!cameraComponent || !cameraComponent.get) {
+              throw new Error('Camera component not available');
+            }
+            
+            const camera = cameraComponent.get() as THREE.PerspectiveCamera;
+            if (!camera || !camera.position) {
+              throw new Error('Camera not available');
+            }
+            
+            // Oblicz odpowiednią odległość kamery bazując na rozmiarze modelu i FOV
+            const fov = camera.fov || 60;
+            const distance = maxDim / (2 * Math.tan((fov * Math.PI) / 360)) * 1.5;
+            
+            // Ustaw pozycję kamery pod kątem 45° (lepszy widok izometryczny)
+            const offset = distance / Math.sqrt(3);
+            camera.position.set(
+              center.x + offset,
+              center.y + offset,
+              center.z + offset
+            );
+            
+            // Zaktualizuj target kontrolek używając setLookAt (najbardziej niezawodne)
+            if (cameraComponent.controls && cameraComponent.controls.setLookAt) {
+              cameraComponent.controls.setLookAt(
+                camera.position.x,
+                camera.position.y,
+                camera.position.z,
+                center.x,
+                center.y,
+                center.z,
+                false
+              );
+            } else if (cameraComponent.controls && cameraComponent.controls.target) {
+              // Fallback: ustaw target bezpośrednio
+              cameraComponent.controls.target.set(center.x, center.y, center.z);
+              camera.lookAt(center);
+            }
+            
+            // Zaktualizuj kontrolki
+            if (cameraComponent.controls && cameraComponent.controls.update) {
+              cameraComponent.controls.update();
+            }
+            
+            camera.updateProjectionMatrix();
+            
+            console.log('📷 Camera fitted to model:', { 
+              center: center.toArray(), 
+              size: size.toArray(), 
+              distance,
+              cameraPosition: camera.position.toArray()
+            });
+          } catch (cameraError) {
+            console.warn('⚠️ Could not fit camera to model:', cameraError);
+            
+            // Fallback: prostsze ustawienie kamery
+            try {
+              const cameraComponent = viewer.camera as any;
+              if (cameraComponent && cameraComponent.get) {
+                const camera = cameraComponent.get() as THREE.PerspectiveCamera;
+                if (camera) {
+                  camera.position.set(50, 50, 50);
+                  camera.lookAt(0, 0, 0);
+                  camera.updateProjectionMatrix();
+                  
+                  // Spróbuj także zaktualizować kontrolki
+                  if (cameraComponent.controls && cameraComponent.controls.setLookAt) {
+                    cameraComponent.controls.setLookAt(50, 50, 50, 0, 0, 0, false);
+                  }
+                  
+                  console.log('📷 Using fallback camera position');
+                }
+              }
+            } catch (fallbackError) {
+              console.error('❌ Camera setup completely failed:', fallbackError);
+            }
+          }
+        }
+      }
+      
+      // Poinformuj użytkownika o sukcesie
+      handleParsed({
+        elements: [],
+        costs: null,
+        element_count: 0,
+        costs_calculated: false,
+      });
+      
+      // Wyczyść komunikat o błędzie
+      handleError('');
+      
+      // Wymuś odświeżenie renderera
+      if (viewer.renderer) {
+        try {
+          const renderer = (viewer.renderer as any).get();
+          if (renderer && renderer.render) {
+            const scene = viewer.scene?.get();
+            const camera = (viewer.camera as any).get();
+            if (scene && camera) {
+              renderer.render(scene, camera);
+              console.log('🎨 Forced renderer update');
+            }
+          }
+        } catch (renderError) {
+          console.warn('Could not force render update:', renderError);
+        }
+      }
+      
+      setIsLoading(false);
+      
+      console.log('🎉 Model loaded and displayed successfully!');
+    } catch (error: any) {
+      console.error('❌ Error loading IFC file:', error);
+      handleError(`Błąd ładowania pliku: ${error.message || 'Nieznany błąd'}`);
+      setIsLoading(false);
+    }
+  };
+
+  // Funkcje do obsługi przeciągania okienka IFCUploader
+  const handleUploaderMouseDown = (e: React.MouseEvent) => {
+    // Tylko lewy przycisk myszy i tylko gdy kliknięto na nagłówek
+    if (e.button !== 0) return;
+    
+    setIsDraggingUploader(true);
+    dragStartPos.current = { x: e.clientX, y: e.clientY };
+    uploaderStartPos.current = { ...uploaderPosition };
+    e.preventDefault();
+  };
+
+  const handleUploaderMouseMove = (e: MouseEvent) => {
+    if (!isDraggingUploader) return;
+    
+    const deltaX = e.clientX - dragStartPos.current.x;
+    const deltaY = e.clientY - dragStartPos.current.y;
+    
+    // Oblicz nową pozycję
+    let newX = uploaderStartPos.current.x + deltaX;
+    let newY = uploaderStartPos.current.y + deltaY;
+    
+    // Ograniczenia - upewnij się, że okienko nie wyjdzie poza ekran
+    const uploaderWidth = 280; // szerokość okienka
+    const uploaderHeight = 500; // przybliżona wysokość okienka
+    
+    newX = Math.max(0, Math.min(newX, window.innerWidth - uploaderWidth));
+    newY = Math.max(0, Math.min(newY, window.innerHeight - 100)); // przynajmniej 100px nagłówka widoczne
+    
+    setUploaderPosition({
+      x: newX,
+      y: newY,
+    });
+  };
+
+  const handleUploaderMouseUp = () => {
+    setIsDraggingUploader(false);
+  };
+
+  // Dodaj/usuń event listeners dla przeciągania
+  useEffect(() => {
+    if (isDraggingUploader) {
+      window.addEventListener('mousemove', handleUploaderMouseMove);
+      window.addEventListener('mouseup', handleUploaderMouseUp);
+      
+      return () => {
+        window.removeEventListener('mousemove', handleUploaderMouseMove);
+        window.removeEventListener('mouseup', handleUploaderMouseUp);
+      };
+    }
+  }, [isDraggingUploader]);
+
+  // Dostosuj pozycję okienka przy zmianie rozmiaru okna
+  useEffect(() => {
+    const handleResize = () => {
+      setUploaderPosition(prev => {
+        const uploaderWidth = 280;
+        const newX = Math.max(0, Math.min(prev.x, window.innerWidth - uploaderWidth));
+        const newY = Math.max(0, Math.min(prev.y, window.innerHeight - 100));
+        return { x: newX, y: newY };
+      });
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  return (
+    <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column' }}>
+      {/* Header z nazwą aplikacji */}
+      <header className={theme === 'dark' ? 'header-dark' : 'header-light'} style={{
+        borderBottom: theme === 'dark' ? '1px solid #374151' : '1px solid #e5e7eb',
+        padding: '12px 20px',
+        backgroundColor: theme === 'dark' ? '#1f2937' : '#ffffff',
+        zIndex: 100,
+        boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)',
+      }}>
+        <h1 style={{
+          fontSize: '1.5rem',
+          fontWeight: 'bold',
+          color: theme === 'dark' ? '#f9fafb' : '#111827',
+          margin: 0,
+        }}>
+          IFC Construction Calculator
+        </h1>
+        <p style={{
+          fontSize: '0.875rem',
+          color: theme === 'dark' ? '#9ca3af' : '#6b7280',
+          margin: '4px 0 0 0',
+        }}>
+          Wizualizacja i analiza konstrukcji budowlanych
+        </p>
+      </header>
+
+      <div 
+        ref={viewerContainerRef} 
+        style={{ 
+          width: '100%', 
+          flex: 1, 
+          position: 'relative',
+          touchAction: 'none', // Ważne dla kontrolek kamery
+        }}
+      >
+        <ActionBar onActionSelect={handleActionSelect} />
+      
+      {/* IFC Uploader - górny panel (przeciągalny) */}
+      <div style={{
+        position: 'absolute',
+        top: `${uploaderPosition.y}px`,
+        left: `${uploaderPosition.x}px`,
+        zIndex: 1000,
+        pointerEvents: 'none',
+      }}>
+        <div style={{ 
+          pointerEvents: 'auto',
+          backgroundColor: 'hsl(var(--card))',
+          borderRadius: '8px',
+          border: '1px solid hsl(var(--border))',
+          overflow: 'hidden',
+        }}>
+          {/* Przeciągalny nagłówek */}
+          <div 
+            onMouseDown={handleUploaderMouseDown}
+            style={{
+              padding: '8px 12px',
+              backgroundColor: isDraggingUploader ? 'hsl(var(--accent))' : 'hsl(var(--muted))',
+              cursor: isDraggingUploader ? 'grabbing' : 'grab',
+              userSelect: 'none',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              transition: 'background-color 0.2s',
+            }}
+          >
+            <span style={{ fontSize: '16px' }}>⊞</span>
+            <span style={{ 
+              fontSize: '12px', 
+              fontWeight: '500',
+              color: 'hsl(var(--muted-foreground))',
+            }}>
+              Przeciągnij, aby przesunąć
+            </span>
+          </div>
+          
+          <IFCUploader
+            onParsed={handleParsed}
+            onError={handleError}
+            isLoading={isLoading}
+            setIsLoading={setIsLoading}
+            onLocalLoad={handleLocalFileLoad}
+          />
+        </div>
+      </div>
+
+      {/* Cost Summary - panel kosztów */}
+      {costs && (
+        <div style={{
+          position: 'absolute',
+          top: '80px',
+          right: '20px',
+          zIndex: 90,
+          pointerEvents: 'none',
+        }}>
+          <div style={{ pointerEvents: 'auto' }}>
+            <CostSummary costs={costs} />
+          </div>
+        </div>
+      )}
+
+      {/* Visibility Controls - widoczność typów */}
+      {elements.length > 0 && (
+        <div style={{
+          position: 'absolute',
+          top: '20px',
+          left: '20px',
+          zIndex: 90,
+          pointerEvents: 'none',
+        }}>
+          <div style={{ pointerEvents: 'auto' }}>
+            <VisibilityControls
+              visibleTypes={visibleTypes}
+              onTypeVisibilityChange={handleTypeVisibilityChange}
+              onShowAll={showAllTypes}
+              onHideAll={hideAllTypes}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Elements List - lista elementów */}
+      {elements.length > 0 && (
+        <div style={{
+          position: 'absolute',
+          bottom: '100px',
+          left: '20px',
+          zIndex: 90,
+          maxHeight: '300px',
+          overflowY: 'auto',
+          pointerEvents: 'none',
+        }}>
+          <div style={{ pointerEvents: 'auto' }}>
+            <ElementsList elements={elements} />
+          </div>
+        </div>
+      )}
+
+      {/* Loading/Error status */}
+      {isLoading && (
+        <div style={{
+          position: 'absolute',
+          top: '50%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          zIndex: 1000,
+          backgroundColor: 'rgba(0,0,0,0.8)',
+          color: 'white',
+          padding: '20px',
+          borderRadius: '8px',
+          pointerEvents: 'auto',
+        }}>
+          Ładowanie modelu IFC...
+        </div>
+      )}
+
+      {error && (
+        <div style={{
+          position: 'absolute',
+          top: '50%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          zIndex: 1000,
+          backgroundColor: 'rgba(220,38,38,0.9)',
+          color: 'white',
+          padding: '20px',
+          borderRadius: '8px',
+          pointerEvents: 'auto',
+        }}>
+          Błąd: {error}
+        </div>
+      )}
+      
+      {/* Panel z paletą kolorów dla pinowania */}
+      {isPinMode && (
+        <div 
+          className="pin-color-palette"
+          style={{
+            position: 'absolute',
+            top: '80px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            backgroundColor: 'hsl(var(--background))',
+            border: '1px solid hsl(var(--border))',
+            borderRadius: '8px',
+            padding: '12px',
+            boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)',
+            zIndex: 1000,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+            pointerEvents: 'auto',
+          }}
+        >
+          <div style={{ 
+            fontSize: '14px', 
+            fontWeight: '600', 
+            color: 'hsl(var(--foreground))',
+            marginBottom: '4px'
+          }}>
+            📌 Wybierz kolor pinezki
+          </div>
+          
+          <div style={{ 
+            display: 'flex', 
+            gap: '8px',
+            flexWrap: 'wrap',
+            maxWidth: '300px'
+          }}>
+            {pinColors.map((colorOption) => (
+              <button
+                key={colorOption.color}
+                onClick={() => setSelectedPinColor(colorOption.color)}
+                style={{
+                  width: '40px',
+                  height: '40px',
+                  borderRadius: '8px',
+                  border: selectedPinColor === colorOption.color 
+                    ? '3px solid hsl(var(--primary))' 
+                    : '2px solid hsl(var(--border))',
+                  backgroundColor: colorOption.color,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s',
+                  boxShadow: selectedPinColor === colorOption.color 
+                    ? '0 0 0 2px hsl(var(--background)), 0 0 0 4px hsl(var(--primary))' 
+                    : 'none',
+                }}
+                title={colorOption.name}
+              />
+            ))}
+          </div>
+          
+          <div style={{
+            fontSize: '12px',
+            color: 'hsl(var(--muted-foreground))',
+            marginTop: '4px',
+            textAlign: 'center'
+          }}>
+            Kliknij na elementy aby je oznaczyć
+          </div>
+        </div>
+      )}
+      
+      {showCommentPanel && (
+        <CommentPanel
+          comments={getAllComments()}
+          selectedElementId={selectedElementId}
+          selectedElementName={selectedElementName}
+          onAddComment={handleAddComment}
+          onDeleteComment={handleDeleteComment}
+          onClose={handleCloseCommentPanel}
+          onCommentClick={handleCommentClick}
+        />
+      )}
+
+      {/* Panel opcji wymiarowania */}
+      <DimensionOptionsPanel
+        isOpen={isDimensionMode}
+        orthogonalMode={dimensionOrthogonal}
+        snapToPoints={dimensionSnap}
+        alignToEdgeMode={alignToEdgeMode}
+        onOrthogonalChange={setDimensionOrthogonal}
+        onSnapChange={setDimensionSnap}
+        onAlignToEdgeChange={setAlignToEdgeMode}
+      />
+
+      {/* Panel wyszukiwania */}
+      {showSearchPanel && (
+        <SearchPanel
+          onClose={() => setShowSearchPanel(false)}
+          onSelectElement={handleSearchSelect}
+          searchFunction={searchElements}
+          onAddToSelection={addToSelection}
+        />
+      )}
+
+      {/* Panel selekcji i izolacji */}
+      {showSelectionPanel && (
+        <SelectionPanel
+          selectedElements={selectedElements}
+          isIsolated={isIsolated}
+          onClose={() => setShowSelectionPanel(false)}
+          onRemoveElement={removeFromSelection}
+          onClearSelection={clearSelection}
+          onIsolate={isolateElements}
+          onUnisolate={unisolateElements}
+          onSelectElement={handleSelectionElementClick}
+        />
+      )}
+
+      </div>
+    </div>
+  );
+};
+
+export default Viewer;
+
